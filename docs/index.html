@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dyndns.devgeek.io — Cloudflare Dynamic DNS</title>
+<meta name="description" content="A tiny, dependency-free dynamic DNS updater that keeps your Cloudflare A records pointed at your current public IP — built in Zig, shipped as a minimal container.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+<style>
+  :root {
+    --bg: #0b1020;
+    --fg: #e8ecf3;
+    --muted: #93a0b8;
+    --accent: #f6821f;      /* cloudflare orange */
+    --accent2: #3b82f6;     /* network blue    */
+    --card: #141b30;
+    --border: #1f2b47;
+    --code-bg: #0e1626;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Nav ─────────────────────────────────────────── */
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 1.5rem;
+    padding: .85rem 2rem;
+    background: rgba(11,16,32,.92);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(6px);
+  }
+  nav .brand { font-weight: 700; color: var(--fg); letter-spacing: .02em; }
+  nav .brand em { color: var(--accent); font-style: normal; }
+  nav .links { margin-left: auto; display: flex; gap: 1.25rem; font-size: .92rem; }
+  nav .links a { color: var(--muted); }
+  nav .links a:hover { color: var(--fg); }
+
+  /* ── Hero ────────────────────────────────────────── */
+  .hero {
+    padding: 5.5rem 2rem 4rem;
+    text-align: center;
+    background:
+      radial-gradient(circle at 78% 18%, rgba(59,130,246,.12) 0, transparent 45%),
+      radial-gradient(circle at 20% 80%, rgba(246,130,31,.10) 0, transparent 45%),
+      var(--bg);
+  }
+  .hero .badge {
+    display: inline-flex; align-items: center; gap: .4rem;
+    font-size: .8rem; color: var(--accent);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: .25rem .8rem;
+    background: rgba(246,130,31,.08);
+  }
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.2rem); font-weight: 800; margin: 1.5rem 0 .5rem; }
+  .hero h1 .dot { color: var(--accent); }
+  .hero p.lede { font-size: 1.15rem; color: var(--muted); max-width: 42rem; margin: .4rem auto 0; }
+  .hero .cta { margin-top: 2.25rem; display: flex; gap: .9rem; flex-wrap: wrap; justify-content: center; }
+  .cta .primary {
+    background: var(--accent); color: #0b1020; font-weight: 700;
+    border-radius: .6rem; padding: .85rem 1.6rem; text-decoration: none;
+    transition: transform .12s ease;
+  }
+  .cta .primary:hover { transform: translateY(-1px); }
+  .cta .ghost {
+    border: 1px solid var(--border); color: var(--fg);
+    border-radius: .6rem; padding: .85rem 1.6rem; text-decoration: none;
+  }
+  .hero .mono {
+    margin-top: 2.5rem; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: .85rem; color: var(--muted);
+    display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; justify-content: center;
+  }
+
+  /* ── Sections ────────────────────────────────────── */
+  section { max-width: 60rem; margin: 0 auto; padding: 5rem 1.4rem; }
+  section h2 { font-size: 1.7rem; font-weight: 750; margin-bottom: .35rem; }
+  section .sub { color: var(--muted); max-width: 46rem; margin-bottom: 2.25rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1.25rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: .9rem;
+    padding: 1.5rem;
+  }
+  .card h3 { font-size: 1.05rem; color: var(--fg); margin-bottom: .5rem; }
+  .card h3 .ic { margin-right: .5rem; }
+  .card p { color: var(--muted); font-size: .92rem; }
+
+  /* ── Flow ────────────────────────────────────────── */
+  .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: .75rem; }
+  .flow .step {
+    background: var(--card); border: 1px solid var(--border); border-radius: .7rem;
+    padding: 1.1rem; text-align: center;
+  }
+  .flow .step .num {
+    width: 1.6rem; height: 1.6rem; margin: 0 auto .45rem;
+    display: grid; place-items: center; border-radius: 50%;
+    background: var(--accent); color: #0b1020; font-weight: 800; font-size: .85rem;
+  }
+  .flow .step strong { display: block; font-size: .92rem; color: var(--fg); }
+  .flow .step span { font-size: .8rem; color: var(--muted); }
+  .flow .arrow { place-self: center; color: var(--accent2); font-size: 1.1rem; }
+
+  /* ── Install ─────────────────────────────────────── */
+  pre {
+    background: var(--code-bg); color: #d6e2f2; font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: .85rem; line-height: 1.55;
+    border: 1px solid var(--border); border-radius: .7rem;
+    padding: 1.1rem 1.3rem; overflow-x: auto;
+  }
+  pre .cm { color: #5f7aa0; }   /* comment */
+  pre .k  { color: #d4733d; }   /* keyword */
+  pre .s  { color: #9bc76a; }   /* string */
+  pre .v  { color: #e8ecf3; }   /* var */
+
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1.25rem; }
+  .cols h3 { color: var(--fg); font-size: 1rem; margin-bottom: .6rem; }
+
+  table.env { width: 100%; border-collapse: collapse; font-size: .86rem; }
+  table.env th, table.env td { text-align: left; padding: .55rem .8rem; border-bottom: 1px solid var(--border); }
+  table.env th { color: var(--muted); }
+  table.env td code { background: var(--code-bg); border-radius: .3rem; padding: 0 .3rem; font-size: .8rem; }
+  table.env tr:last-child td { border-bottom: none; }
+
+  .foot {
+    margin-top: 3.5rem; text-align: center; color: var(--muted); font-size: .85rem;
+    border-top: 1px solid var(--border); padding: 2rem 1rem;
+  }
+  .foot code { font-size: .8rem; }
+
+  @media (max-width: 640px) {
+    .flow { grid-template-columns: 1fr 1fr; }
+    .flow .arrow { display: none; }
+    .hero { padding: 4rem 1rem 3rem; }
+    section { padding: 4rem 1rem; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="brand">dyndns<em>.devgeek.io</em></span>
+  <div class="links">
+    <a href="#why">Why</a>
+    <a href="#how">How it works</a>
+    <a href="#install">Install</a>
+    <a href="#config">Config</a>
+    <a href="https://github.com/teilin/dyndns-cloudflare" target="_blank" rel="noopener">GitHub ↗</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <span class="badge">✦ &nbsp;Zig 0.16 &nbsp;·&nbsp; zero dependencies &nbsp;·&nbsp; ~4 MB image</span>
+  <h1>Your IP moves.<br>Your DNS keeps&nbsp;<span class="dot">up.</span></h1>
+  <p class="lede">
+    A tiny dynamic-DNS daemon that watches your public IP and, the moment it changes,
+    re-points your Cloudflare A record &mdash; so <code>vpn.devgeek.io</code> (or any host)
+    always resolves to you. No Python. No Node. No bloat.
+  </p>
+  <div class="cta">
+    <a class="primary" href="#install">Get the image</a>
+    <a class="ghost" href="https://github.com/teilin/dyndns-cloudflare" target="_blank" rel="noopener">View source</a>
+  </div>
+  <div class="mono">
+    <span>🛰️ public IP</span> <span>→</span> <span>compare</span> <span>→</span>
+    <span class="k">PATCH</span>&nbsp;api.cloudflare.com <span>→</span> <span>done</span>
+  </div>
+</section>
+
+<section id="why">
+  <h2>Why this exists</h2>
+  <p class="sub">
+    Most home/VPN setups sit on a dynamic IP. Many solutions bolt a heavyweight
+    runtime onto a NAS just to update one DNS record. This one is a single static binary.
+  </p>
+  <div class="grid">
+    <div class="card"><h3><span class="ic">⚡</span>Truly minimal</h3><p>One statically-linked Zig binary in a ~4&nbsp;MB Alpine container. Nothing else runs.</p></div>
+    <div class="card"><h3><span class="ic">🔐</span>TLS by default</h3><p>HTTPS end-to-end using Zig's own TLS stack with system CA verification.</p></div>
+    <div class="card"><h3><span class="ic">🧠</span>Smarts, not storms</h3><p>Only calls the Cloudflare API when your IP actually changed &mdash; no churn, no rate limits.</p></div>
+    <div class="card"><h3><span class="ic">🛡️</span>Stateful</h3><p>Persists the last-known IP to a volume, so restarts don't force pointless updates.</p></div>
+    <div class="card"><h3><span class="ic">🪶</span>Self-hosted</h3><p>Runs on any NAS, Pi, or VPS with Docker. Your credentials never leave your network.</p></div>
+    <div class="card"><h3><span class="ic">🐧</span>Cross-platform</h3><p>Static musl build. Runs anywhere an amd64 container runs, with no fragile runtimes.</p></div>
+  </div>
+</section>
+
+<section id="how">
+  <h2>How it works</h2>
+  <p class="sub">Run it, forget it. Each pass is four steps and returns quickly when nothing changed.</p>
+  <div class="flow">
+    <div class="step"><div class="num">1</div><strong>Fetch</strong><span>current public IP from a plaintext service (ipify)</span></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="num">2</div><strong>Compare</strong><span>against the last IP it stored locally</span></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="num">3</div><strong>Sync</strong><span><code>PATCH</code> the Cloudflare A record if it drifted</span></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="num">4</div><strong>Persist</strong><span>the new IP &amp; sleep until next check</span></div>
+  </div>
+  <div class="mono" style="margin-top:1.5rem">— happy path: <span style="color:var(--muted)">1 HTTP GET, 0 writes, exited 0</span> —</div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <p class="sub">Pull from GitHub Container Registry and run it with four env vars. That's the whole setup.</p>
+  <pre><span class="cm"># 1. pull the public image</span>
+docker pull <span class="s">ghcr.io/teilin/dyndns-cloudflare:latest</span>
+
+<span class="cm"># 2. run it (drop the -d and add --rm for a one-shot check in the foreground)</span>
+docker run -d --name dyndns \
+  <span class="k">-e</span> CLOUDFLARE_API_TOKEN=<span class="s">"$CF_API_TOKEN"</span> \
+  <span class="k">-e</span> CLOUDFLARE_ZONE_ID=<span class="s">"$CF_ZONE_ID"</span> \
+  <span class="k">-e</span> CLOUDFLARE_RECORD_ID=<span class="s">"$CF_RECORD_ID"</span> \
+  <span class="k">-e</span> CLOUDFLARE_RECORD_NAME=<span class="s">vpn.devgeek.io</span> \
+  <span class="k">-v</span> dyndns-state:/config \
+  --restart unless-stopped \
+  <span class="s">ghcr.io/teilin/dyndns-cloudflare:latest</span></pre>
+  <p style="color:var(--muted); font-size:.9rem">
+    Mount a named volume on <code>/config</code> so the last-known IP survives container restarts.
+  </p>
+</section>
+
+<section id="config">
+  <h2>Configuration</h2>
+  <p class="sub">All configuration is via environment variables &mdash; no config file, no YAML.</p>
+  <table class="env">
+    <thead><tr><th>Variable</th><th>Required</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>CLOUDFLARE_API_TOKEN</code></td><td>yes</td><td>API token with <code>Zone → DNS → Edit</code> permission</td></tr>
+      <tr><td><code>CLOUDFLARE_ZONE_ID</code></td><td>yes</td><td>Zone ID for the domain (devgeek.io)</td></tr>
+      <tr><td><code>CLOUDFLARE_RECORD_ID</code></td><td>yes</td><td>DNS record ID of the A record to update</td></tr>
+      <tr><td><code>CLOUDFLARE_RECORD_NAME</code></td><td>yes</td><td>FQDN of the record, e.g. <code>vpn.devgeek.io</code></td></tr>
+    </tbody>
+  </table>
+  <p style="color:var(--muted); font-size:.9rem; margin-top:1rem">
+    Tip: find <code>ZONE_ID</code> and <code>RECORD_ID</code> via the Cloudflare API, or grab them from the URL
+    of the dashboard / API responses when you look up the record.
+  </p>
+</section>
+
+<footer class="foot">
+  <p><strong>dyndns.devgeek.io</strong> &nbsp;·&nbsp; a <code>teilin/dyndns-cloudflare</code> project &nbsp;·&nbsp; built with Zig 0.16.0</p>
+  <p style="margin-top:.4rem"><a href="https://github.com/teilin/dyndns-cloudflare" target="_blank" rel="noopener">Source</a> &nbsp;·&nbsp; <a href="https://github.com/teilin/dyndns-cloudflare/blob/dev/Dockerfile" target="_blank" rel="noopener">Dockerfile</a> &nbsp;·&nbsp; <a href="https://ghcr.io/teilin/dyndns-cloudflare" target="_blank" rel="noopener">GHCR</a></p>
+</footer>
+
+</body>
+</html>
