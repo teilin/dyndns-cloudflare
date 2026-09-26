@@ -1,0 +1,9 @@
+.git
+.gitignore
+.github
+.zig-cache
+zig-out
+Dockerfile
+*.md
+config/
+.env
