@@ -12,6 +12,8 @@ pub fn build(b: *std.Build) void {
         .name = "ipwatch",
         .root_module = module,
     });
+    exe.root_module.linkSystemLibrary("c", .{});
+    exe.root_module.linkSystemLibrary("m", .{});
     b.installArtifact(exe);
 
     const tests = b.addTest(.{

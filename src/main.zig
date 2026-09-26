@@ -1,10 +1,9 @@
 const std = @import("std");
+const http = std.http;
 const c = std.c;
 
-const IPIFY_HOST = "api.ipify.org";
-const IPIFY_PATH = "/";
-const CLOUDFLARE_API = "api.cloudflare.com";
-const CLOUDFLARE_DNS_PATH = "/client/v4/zones/{zone_id}/dns_records/{record_id}";
+const IPIFY_URL = "https://api.ipify.org";
+const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 const ENV_TOKEN = "CLOUDFLARE_API_TOKEN";
 const ENV_ZONE = "CLOUDFLARE_ZONE_ID";
 const ENV_RECORD = "CLOUDFLARE_RECORD_ID";
@@ -15,37 +14,35 @@ const STATE_FILE = "/config/previous_ip.txt";
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    _ = init;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const env = init.minimal.environ;
 
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const api_token = init.environ.getPosix(ENV_TOKEN) orelse {
+    const api_token = env.getPosix(ENV_TOKEN) orelse {
         std.log.err("missing {s}", .{ENV_TOKEN});
         std.process.exit(1);
     };
-    const zone_id = init.environ.getPosix(ENV_ZONE) orelse {
+    const zone_id = env.getPosix(ENV_ZONE) orelse {
         std.log.err("missing {s}", .{ENV_ZONE});
         std.process.exit(1);
     };
-    const record_id = init.environ.getPosix(ENV_RECORD) orelse {
+    const record_id = env.getPosix(ENV_RECORD) orelse {
         std.log.err("missing {s}", .{ENV_RECORD});
         std.process.exit(1);
     };
-    const record_name = init.environ.getPosix(ENV_RECORD_NAME) orelse {
+    const record_name = env.getPosix(ENV_RECORD_NAME) orelse {
         std.log.err("missing {s}", .{ENV_RECORD_NAME});
         std.process.exit(1);
     };
 
-    // Get current public IP
-    const current_ip = try httpGet(allocator, IPIFY_HOST, IPIFY_PATH, null, null);
+    // 1. Current public IP
+    const current_ip = try httpBody(io, allocator, .GET, IPIFY_URL, null, null);
     defer allocator.free(current_ip);
     std.log.info("current public IP: {s}", .{current_ip});
 
-    // Load previous IP
-    const prev_ip = loadPreviousIP(allocator);
+    // 2. Previous known IP (local state file)
+    const prev_ip = try loadPreviousIP(allocator);
     defer if (prev_ip) |p| allocator.free(p);
 
     if (prev_ip) |prev| {
@@ -58,33 +55,42 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.log.info("no previous IP on record, will update DNS", .{});
     }
 
-    // Check current DNS record on Cloudflare
-    const dns_url = try std.fmt.allocPrint(allocator, CLOUDFLARE_DNS_PATH, .{ .zone_id = zone_id, .record_id = record_id });
+    // 3. Build the Cloudflare DNS URL once
+    const dns_url = try std.mem.concat(allocator, u8, &.{ CLOUDFLARE_API_BASE, "/zones/", zone_id, "/dns_records/", record_id });
     defer allocator.free(dns_url);
 
-    const dns_ip = try httpGet(allocator, CLOUDFLARE_API, dns_url, api_token, null);
-    defer if (dns_ip) |p| allocator.free(p);
+    // 4. Current DNS record value from Cloudflare
+    const get_resp = try httpFetch(io, allocator, .GET, dns_url, api_token, null);
+    defer if (get_resp.body) |b| allocator.free(b);
 
-    if (dns_ip) |dns| {
-        if (std.mem.eql(u8, current_ip, dns)) {
-            std.log.info("DNS record already correct ({s}), skipping update", .{dns});
-            try savePreviousIP(allocator, current_ip);
-            return;
+    if (get_resp.status == 200) {
+        if (get_resp.body) |dns_json| {
+            const dns_field = try parseJSONField(allocator, dns_json, "content");
+            defer if (dns_field) |f| allocator.free(f);
+            if (dns_field) |dns_val| {
+                if (std.mem.eql(u8, current_ip, dns_val)) {
+                    std.log.info("DNS record already correct ({s}), skipping update", .{dns_val});
+                    try savePreviousIP(allocator, current_ip);
+                    return;
+                }
+                std.log.info("DNS record mismatch: Cloudflare has {s}, expected {s}", .{ dns_val, current_ip });
+            }
         }
-        std.log.info("DNS record mismatch: Cloudflare has {s}, expected {s}", .{ dns, current_ip });
+    } else {
+        std.log.info("Cloudflare GET returned HTTP {d}", .{get_resp.status});
     }
 
-    // Build PATCH body
+    // 5. Build PATCH body and update DNS record
     const body = try std.fmt.allocPrint(allocator,
         \\{{"type":"A","name":"{s}","content":"{s}"}}
     , .{ record_name, current_ip });
     defer allocator.free(body);
 
-    const resp = try httpPatch(allocator, CLOUDFLARE_API, dns_url, api_token, body);
-    defer if (resp.body) |b| allocator.free(b);
+    const patch_resp = try httpFetch(io, allocator, .PATCH, dns_url, api_token, body);
+    defer if (patch_resp.body) |b| allocator.free(b);
 
-    if (resp.status != 200) {
-        std.log.err("Cloudflare PATCH returned {d}: {s}", .{ resp.status, resp.body orelse "" });
+    if (patch_resp.status != 200) {
+        std.log.err("Cloudflare PATCH returned {d}: {s}", .{ patch_resp.status, patch_resp.body orelse "" });
         return error.CloudflareUpdateFailed;
     }
 
@@ -93,7 +99,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HTTP client — std.c sockets + manual TLS via Zig's crypto
+// HTTP client via std.http.Client — handles TLS, redirects, chunking
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HttpResponse = struct {
@@ -101,227 +107,69 @@ const HttpResponse = struct {
     body: ?[]u8,
 };
 
-/// Perform a GET request over a TLS socket.
-fn httpGet(allocator: std.mem.Allocator, host: []const u8, path: []const u8, bearer: ?[]const u8, body: ?[]const u8) (error{} || std.mem.Allocator.Error || std.crypto.tls.Client.Error)!?[]u8 {
-    const is_https = true;
+/// One-shot HTTP request; returns captured status and body.
+fn httpFetch(io: std.Io, allocator: std.mem.Allocator, method: http.Method, url: []const u8, bearer: ?[]const u8, payload: ?[]const u8) !HttpResponse {
+    var client = http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
 
-    // Resolve host
-    const addr = try dnsResolve(allocator, host);
-    defer allocator.free(addr);
-    if (addr.len == 0) return null;
-
-    const port: u16 = if (is_https) 443 else 80;
-    const sock = try tcpConnect(addr[0], port);
-    defer _ = c.close(sock);
-
-    var tls_client: ?std.crypto.tls.Client = null;
-    var tls_buf: [8192]u8 = undefined;
-    var tls_buf_offset: usize = 0;
-    var tls_read_buf: [8192]u8 = undefined;
-
-    if (is_https) {
-        const socket = std.net.Stream{ .handle = sock };
-        tls_client = std.crypto.tls.Client.init(socket, .{
-            .ca_bundle = std.crypto.Certificate.Bundle{},
-            .peer_name = host,
-        }) catch return null;
+    // Build Authorization header if a token was provided.
+    var headers = std.array_list.AlignedManaged(http.Header, null).init(allocator);
+    defer headers.deinit();
+    if (bearer) |token| {
+        try headers.append(.{ .name = "Authorization", .value = token });
     }
 
-    defer if (tls_client) |*c2| c2.deinit();
+    var response_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer response_writer.deinit();
 
-    // Build and send HTTP request
-    const req = buildHttpRequest(host, path, bearer, null, null);
-    if (is_https) {
-        if (tls_client) |*c2| {
-            _ = c2.writer().writeAll(req) catch return null;
-            c2.writer().flush() catch return null;
-        }
-    } else {
-        _ = c.write(sock, req.ptr, req.len);
-    }
-
-    // Read response
-    var response_buf = std.array_list.AlignedManaged(u8, null).init(allocator);
-    defer response_buf.deinit();
-
-    if (is_https) {
-        if (tls_client) |*c2| {
-            // Read until connection closes or we have enough
-            var done = false;
-            while (!done) {
-                const n = c2.reader().read(&tls_read_buf) catch break;
-                if (n == 0) done = true;
-                response_buf.appendSliceAssumeCapacity(tls_read_buf[0..n]);
-                // Simple EOF detection
-                if (n < tls_read_buf.len) done = true;
-            }
-        }
-    } else {
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n = c.read(sock, &buf, buf.len);
-            if (n <= 0) break;
-            response_buf.appendSliceAssumeCapacity(buf[0..n]);
-            if (@as(u64, @intCast(n)) < buf.len) break;
-        }
-    }
-
-    return parseHttpResponse(allocator, response_buf.items);
-}
-
-/// Perform a PATCH request.
-fn httpPatch(allocator: std.mem.Allocator, host: []const u8, path: []const u8, bearer: []const u8, body: []const u8) (error{} || std.mem.Allocator.Error || std.crypto.tls.Client.Error)!HttpResponse {
-    const addr = try dnsResolve(allocator, host);
-    defer allocator.free(addr);
-    if (addr.len == 0) return HttpResponse{ .status = 0, .body = null };
-
-    const sock = try tcpConnect(addr[0], 443);
-    defer _ = c.close(sock);
-
-    const socket = std.net.Stream{ .handle = sock };
-    var tls = std.crypto.tls.Client.init(socket, .{
-        .ca_bundle = std.crypto.Certificate.Bundle{},
-        .peer_name = host,
-    }) catch return HttpResponse{ .status = 0, .body = null };
-    defer tls.deinit();
-
-    const content_len = body.len;
-    const req = buildHttpRequest(host, path, bearer, "application/json", content_len);
-    var w = tls.writer();
-    w.writeAll(req) catch return HttpResponse{ .status = 0, .body = null };
-    w.writeAll(body) catch return HttpResponse{ .status = 0, .body = null };
-    w.flush() catch return HttpResponse{ .status = 0, .body = null };
-
-    var response_buf = std.array_list.AlignedManaged(u8, null).init(allocator);
-    errdefer response_buf.deinit();
-
-    var tls_read_buf: [8192]u8 = undefined;
-    var done = false;
-    while (!done) {
-        const n = tls.reader().read(&tls_read_buf) catch break;
-        if (n == 0) done = true;
-        response_buf.appendSliceAssumeCapacity(tls_read_buf[0..n]);
-        if (@as(u64, @intCast(n)) < tls_read_buf.len) done = true;
-    }
-
-    return parseHttpResponseAlloc(allocator, response_buf.items);
-}
-
-fn buildHttpRequest(host: []const u8, path: []const u8, bearer: ?[]const u8, content_type: ?[]const u8, content_length: ?usize) []u8 {
-    var req = std.ArrayList(u8).init(std.heap.page_allocator);
-    req.appendSliceAssumeCapacity("GET ");
-    req.appendSliceAssumeCapacity(path);
-    req.appendSliceAssumeCapacity(" HTTP/1.1\r\nHost: ");
-    req.appendSliceAssumeCapacity(host);
-    req.appendSliceAssumeCapacity("\r\nUser-Agent: ipwatch/1.0\r\n");
-    if (bearer) |tok| {
-        req.appendSliceAssumeCapacity("Authorization: Bearer ");
-        req.appendSliceAssumeCapacity(tok);
-        req.appendSliceAssumeCapacity("\r\n");
-    }
-    if (content_type) |ct| {
-        req.appendSliceAssumeCapacity("Content-Type: ");
-        req.appendSliceAssumeCapacity(ct);
-        req.appendSliceAssumeCapacity("\r\n");
-    }
-    if (content_length) |len| {
-        req.appendSliceAssumeCapacity("Content-Length: ");
-        const len_str = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{len}) catch "";
-        req.appendSliceAssumeCapacity(len_str);
-        req.appendSliceAssumeCapacity("\r\n");
-    }
-    req.appendSliceAssumeCapacity("Connection: close\r\n");
-    req.appendSliceAssumeCapacity("\r\n");
-    return req.toOwnedSlice() catch "";
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DNS resolution  (std.c getaddrinfo)
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn dnsResolve(allocator: std.mem.Allocator, host: []const u8) ![]std.os.linux.sockaddr.in {
-    const c2 = std.c;
-    const hints = c2.addrinfo{
-        .family = c2.AF.INET,
-        .socktype = c2.SOCK.STREAM,
-        .protocol = 0,
-        .flags = 0,
-        .address = undefined,
-        .canonicalname = null,
-        .next = null,
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .payload = payload,
+        .response_writer = &response_writer.writer,
+        .extra_headers = headers.items,
+    }) catch |err| {
+        std.log.err("HTTP request to {s} failed: {any}", .{ url, err });
+        return HttpResponse{ .status = 0, .body = null };
     };
-    var result: [*]c2.addrinfo = undefined;
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-    const rc = c2.getaddrinfo(host_z, null, &hints, &result);
-    if (rc != 0) return error.DNSFailed;
-    defer c2.freeaddrinfo(result);
 
-    var addrs: [4]std.os.linux.sockaddr.in = undefined;
-    var count: usize = 0;
-    var it: [*]c2.addrinfo = result;
-    while (it != null and count < addrs.len) : (it = it.?.next) {
-        if (it.?.family == c2.AF.INET) {
-            addrs[count] = @as(*const std.os.linux.sockaddr.in, @ptrCast(it.?.addr)).*;
-            count += 1;
-        }
+    // Extract body from the allocating writer.
+    var body_al = response_writer.toArrayList();
+    defer body_al.deinit(allocator);
+    const body_bytes = body_al.items;
+
+    return HttpResponse{
+        .status = @intFromEnum(result.status),
+        .body = if (body_bytes.len > 0) try allocator.dupe(u8, body_bytes) else null,
+    };
+}
+
+/// GET that returns the trimmed body, erroring on non-200.
+fn httpBody(io: std.Io, allocator: std.mem.Allocator, method: http.Method, url: []const u8, bearer: ?[]const u8, payload: ?[]const u8) ![]u8 {
+    const resp = try httpFetch(io, allocator, method, url, bearer, payload);
+    defer if (resp.body) |b| allocator.free(b);
+    if (resp.status != 200 or resp.body == null) {
+        std.log.err("request to {s} returned HTTP {d}", .{ url, resp.status });
+        return error.HttpRequestFailed;
     }
-    return try allocator.dupe(std.os.linux.sockaddr.in, addrs[0..count]);
+    return resp.body.?;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TCP connect  (std.c socket + connect)
+// Minimal JSON parser — no external deps
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn tcpConnect(addr: std.os.linux.sockaddr.in, port: u16) !c_int {
-    const c2 = std.c;
-    const sock = c2.socket(c2.AF.INET, c2.SOCK.STREAM, 0);
-    if (sock == -1) return error.SocketFailed;
-    errdefer _ = c2.close(sock);
-
-    var addr2 = addr;
-    addr2.port = std.mem.nativeToBig(u16, port);
-    const rc = c2.connect(sock, @ptrCast(&addr2), @sizeOf(std.os.linux.sockaddr.in));
-    if (rc == -1) return error.ConnectFailed;
-
-    return sock;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HTTP response parser
-// ─────────────────────────────────────────────────────────────────────────────
-
-fn parseHttpResponse(allocator: std.mem.Allocator, data: []const u8) !?[]u8 {
-    // Find status line
-    const eoh = std.mem.indexOfScalar(u8, data, '\r') orelse return null;
-    const status_line = data[0..eoh];
-    const status = parseStatusCode(status_line) orelse return null;
-
-    // Skip headers
-    const body_start = std.mem.indexOfString(data, "\r\n\r\n") orelse return null;
-    const body = data[body_start + 4 ..];
-
-    if (status == 200) {
-        return try allocator.dupe(u8, body);
-    }
-    return null;
-}
-
-fn parseHttpResponseAlloc(allocator: std.mem.Allocator, data: []const u8) !HttpResponse {
-    const eoh = std.mem.indexOfScalar(u8, data, '\r') orelse return HttpResponse{ .status = 0, .body = null };
-    const status = parseStatusCode(data[0..eoh]) orelse HttpResponse{ .status = 0, .body = null };
-    const body_start = std.mem.indexOfString(data, "\r\n\r\n") orelse data.len;
-    const body = if (body_start < data.len) data[body_start + 4 ..] else data[0..0];
-    const body_copy = if (body.len > 0) try allocator.dupe(u8, body) else null;
-    return HttpResponse{ .status = status, .body = body_copy };
-}
-
-fn parseStatusCode(line: []const u8) ?u16 {
-    // "HTTP/1.1 200 OK" — find the 3-digit status code
-    const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
-    const second_space = std.mem.indexOfScalar(u8, line[first_space + 1 ..], ' ') orelse return null;
-    const code_str = line[first_space + 1 .. first_space + 1 + second_space];
-    return std.fmt.parseInt(u16, code_str, 10) catch null;
+/// Extract the string value of `"key":"value"` where value is a JSON string.
+/// Returns owned slice (caller frees); null if not found.
+fn parseJSONField(allocator: std.mem.Allocator, json: []const u8, key: []const u8) !?[]u8 {
+    const search = try std.mem.concat(allocator, u8, &.{ "\"", key, "\":" });
+    defer allocator.free(search);
+    const idx = std.mem.indexOf(u8, json, search) orelse return null;
+    const val_start = idx + search.len;
+    if (val_start >= json.len or json[val_start] != '"') return null;
+    const val_body = json[val_start + 1 ..];
+    const val_end = std.mem.indexOfScalar(u8, val_body, '"') orelse return null;
+    return try allocator.dupe(u8, val_body[0..val_end]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,20 +179,20 @@ fn parseStatusCode(line: []const u8) ?u16 {
 fn loadPreviousIP(allocator: std.mem.Allocator) !?[]u8 {
     const path_z = try allocator.dupeZ(u8, STATE_FILE);
     defer allocator.free(path_z);
-    const fd = c.openat(c.AT.FDCWD, path_z, c.O{ .ACCMODE = .RDONLY }, 0);
+    const fd = c.openat(c.AT.FDCWD, path_z, c.O{ .ACCMODE = .RDONLY }, @as(c.mode_t, 0));
     if (fd == -1) return null;
     defer _ = c.close(fd);
     var buf: [64]u8 = undefined;
     const n = c.read(fd, &buf, buf.len);
     if (n <= 0) return null;
-    return std.mem.trim(u8, try allocator.dupe(u8, buf[0..n]), "\n\r ");
+    return try allocator.dupe(u8, std.mem.trim(u8, buf[0..@intCast(n)], "\n\r "));
 }
 
 fn savePreviousIP(allocator: std.mem.Allocator, ip: []const u8) !void {
     _ = c.mkdirat(c.AT.FDCWD, "/config", 0o755);
     const path_z = try allocator.dupeZ(u8, STATE_FILE);
     defer allocator.free(path_z);
-    const fd = c.openat(c.AT.FDCWD, path_z, c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    const fd = c.openat(c.AT.FDCWD, path_z, c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o644));
     if (fd == -1) return error.FileWriteFailed;
     defer _ = c.close(fd);
     _ = c.write(fd, ip.ptr, ip.len);
@@ -356,61 +204,24 @@ fn savePreviousIP(allocator: std.mem.Allocator, ip: []const u8) !void {
 
 const testing = std.testing;
 
-test "parseStatusCode" {
-    try testing.expectEqual(@as(u16, 200), parseStatusCode("HTTP/1.1 200 OK").?);
-    try testing.expectEqual(@as(u16, 201), parseStatusCode("HTTP/1.1 201 Created").?);
-    try testing.expectEqual(@as(u16, 400), parseStatusCode("HTTP/1.0 400 Bad Request").?);
-    try testing.expectEqual(@as(u16, 404), parseStatusCode("HTTP/1.1 404 Not Found").?);
-    try testing.expectEqual(@as(u16, 200), parseStatusCode("HTTP/2 200 OK").?);
-    try testing.expect(null, parseStatusCode("invalid"));
-    try testing.expect(null, parseStatusCode("200 OK").?);
+test "parseJSONField root string" {
+    const json = "{\"result\":{\"content\":\"1.2.3.4\"}}";
+    const v = try parseJSONField(testing.allocator, json, "content");
+    defer if (v) |x| testing.allocator.free(x);
+    try testing.expect(v != null);
+    try testing.expectEqualStrings("1.2.3.4", v.?);
 }
 
-test "parseHttpResponse" {
-    const data =
-        \\HTTP/1.1 200 OK\r
-        \\Content-Type: text/plain\r
-        \\Content-Length: 7\r
-        \\\r
-        \\1.2.3.4
-    ;
-    const ip = try parseHttpResponse(testing.allocator, data);
-    defer if (ip) |p| testing.allocator.free(p);
-    try testing.expect(ip != null);
-    try testing.expectEqualStrings("1.2.3.4", ip.?);
+test "parseJSONField missing" {
+    const json = "{\"a\":1}";
+    const v: ?[]u8 = try parseJSONField(testing.allocator, json, "content");
+    try testing.expect(v == null);
 }
 
-test "parseHttpResponseAlloc" {
-    const data =
-        \\HTTP/1.1 200 OK\r
-        \\Content-Type: application/json\r
-        \\\r
-        \\{"result":{"content":"9.9.9.9"}}
-    ;
-    const resp = try parseHttpResponseAlloc(testing.allocator, data);
-    defer if (resp.body) |b| testing.allocator.free(b);
-    try testing.expectEqual(@as(u16, 200), resp.status);
-    try testing.expect(resp.body != null);
-    try testing.expectEqualStrings("{\"result\":{\"content\":\"9.9.9.9\"}}", resp.body.?);
-}
-
-test "buildHttpRequest GET" {
-    const req = buildHttpRequest("example.com", "/", null, null, null);
-    defer std.heap.page_allocator.free(req);
-    try testing.expect(std.mem.indexOf(u8, req, "GET / HTTP/1.1").? >= 0);
-    try testing.expect(std.mem.indexOf(u8, req, "Host: example.com").? >= 0);
-    try testing.expect(std.mem.indexOf(u8, req, "Connection: close").? >= 0);
-}
-
-test "buildHttpRequest with bearer" {
-    const req = buildHttpRequest("api.cloudflare.com", "/test", "mytoken", null, null);
-    defer std.heap.page_allocator.free(req);
-    try testing.expect(std.mem.indexOf(u8, req, "Authorization: Bearer mytoken").? >= 0);
-}
-
-test "buildHttpRequest with content-length" {
-    const req = buildHttpRequest("api.cloudflare.com", "/test", null, "application/json", 25);
-    defer std.heap.page_allocator.free(req);
-    try testing.expect(std.mem.indexOf(u8, req, "Content-Length: 25").? >= 0);
-    try testing.expect(std.mem.indexOf(u8, req, "Content-Type: application/json").? >= 0);
+test "parseJSONField nested key" {
+    const json = "\"name\":\"vpn.devgeek.io\",\"content\":\"9.9.9.9\"";
+    const v = try parseJSONField(testing.allocator, json, "name");
+    defer if (v) |x| testing.allocator.free(x);
+    try testing.expect(v != null);
+    try testing.expectEqualStrings("vpn.devgeek.io", v.?);
 }
