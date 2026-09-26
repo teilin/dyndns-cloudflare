@@ -1,9 +1,9 @@
-name: Build, test, and publish container
+name: Publish container
 
 on:
   push:
     branches:
-      - main
+      - dev
 
 permissions:
   contents: read
